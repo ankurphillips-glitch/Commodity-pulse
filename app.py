@@ -178,9 +178,10 @@ TOOL_SUMMARY = {
                         "weight_pct": {"type": "number"},
                         "best_fit_index": {"type": "string"},
                         "is_proxy": {"type": "boolean"},
-                        "brief_note": {"type": "string", "description": "One short sentence on rationale or current trend."}
+                        "projected_change_pct": {"type": "number", "description": "Projected % change in this cost head's input cost over the forecast period."},
+                        "rationale": {"type": "string", "description": "Short rationale (1 sentence) explaining the inflation value, citing specific data."}
                     },
-                    "required": ["name", "weight_pct", "best_fit_index", "is_proxy", "brief_note"]
+                    "required": ["name", "weight_pct", "best_fit_index", "is_proxy", "projected_change_pct", "rationale"]
                 },
                 "minItems": 4, "maxItems": 7
             }
@@ -427,13 +428,17 @@ def run_summary(cat, region, months, api_key):
     notes = research(c,
         f"Today is {t}. Research: {cat} in {region}. Forecast horizon: {months} months. "
         f"Identify 4-7 cost heads summing to 100% with best benchmark indices. "
-        f"Calculate the WEIGHTED AVERAGE % change in total category cost over the next {months} months. "
-        f"Use latest futures, forward prices, and analyst forecasts. "
-        f"Provide brief one-line note per cost head. Note confidence level and last data date.")
+        f"For each cost head, estimate the projected % change in its input cost over the next {months} months. "
+        f"Use latest futures curves, forward prices, and analyst forecasts. "
+        f"Provide a short rationale (1 sentence) for each inflation value, citing specific data points. "
+        f"Then calculate the WEIGHTED AVERAGE % change in total category cost. "
+        f"Note confidence level and last data date.")
     return structure(c, notes, TOOL_SUMMARY,
         f"Structure summary for {cat} in {region} over {months} months. "
         f"check_date = '{t}'. Weights must sum to 100. "
-        f"weighted_avg_change_pct is the estimated TOTAL category cost change over {months} months.")
+        f"For each cost head fill projected_change_pct (positive=increase) and rationale. "
+        f"weighted_avg_change_pct must equal: sum of (projected_change_pct * weight_pct / 100) across all cost heads. "
+        f"direction = up if weighted_avg_change_pct > 0, down if < 0, stable if approximately zero.")
 
 def run_detailed(cat, region, months, cost_head, benchmark, api_key):
     """On-demand call for ONE cost head."""
@@ -511,7 +516,7 @@ with col1:
         label_visibility="collapsed", key="reg_sel")
 
     st.markdown('<span class="lbl" style="margin-top:10px;display:block;">3. Forecast Period</span>', unsafe_allow_html=True)
-    period_str = st.radio("per",
+    period_str = st.selectbox("per",
         ["1 Month", "3 Months", "6 Months"],
         label_visibility="collapsed", key="per_sel", index=1)
     forecast_months = int(period_str.split()[0])
@@ -566,21 +571,23 @@ with col2:
                     f'<div style="font-size:0.85rem;color:var(--t1);margin-bottom:14px;">{selected_cat} &middot; {selected_region}</div>',
                     unsafe_allow_html=True)
         fig = build_pie(summary["cost_heads"])
-        event = st.plotly_chart(fig, use_container_width=True,
-                                 on_select="rerun", selection_mode="points", key="pie_chart")
-        if event and event.get("selection", {}).get("points"):
-            clicked = event["selection"]["points"][0].get("label")
-            if clicked:
-                match = next((h for h in summary["cost_heads"] if h["name"] == clicked), None)
-                if match and (not st.session_state["selected_ch"] or
-                              st.session_state["selected_ch"]["name"] != clicked):
-                    st.session_state["selected_ch"] = match
-                    st.rerun()
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key="pie_chart")
 
         st.markdown(
-            '<div style="font-size:0.7rem;color:var(--t3);text-align:center;margin-top:-4px;">'
-            '&#9670; Click any slice to load detailed analysis below</div>',
+            '<div style="font-size:0.72rem;color:var(--t2);margin:6px 0 8px;text-align:center;">'
+            'Click a cost head below to load its detailed analysis</div>',
             unsafe_allow_html=True)
+
+        # Cost head selection buttons - always reliable
+        ch_cols = st.columns(min(len(summary["cost_heads"]), 3))
+        for i, ch in enumerate(summary["cost_heads"]):
+            with ch_cols[i % 3]:
+                active = (st.session_state.get("selected_ch") and
+                          st.session_state["selected_ch"]["name"] == ch["name"])
+                label = f"▶ {ch['name'][:22]} ({ch['weight_pct']}%)" if active else f"{ch['name'][:22]} ({ch['weight_pct']}%)"
+                if st.button(label, key=f"chbtn_{i}", use_container_width=True):
+                    st.session_state["selected_ch"] = ch
+                    st.rerun()
 
         with st.expander("View supporting data and assumptions"):
             f = summary
@@ -645,6 +652,86 @@ with col3:
             '<div class="placeholder-icon">&#8645;</div>'
             '<div class="placeholder-text">Weighted average price<br>movement will appear here.</div></div>',
             unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ── MIDDLE SECTION — Weighted Average Calculation Table (full width) ───────────
+if summary and not inputs_changed:
+    st.markdown('<hr style="border:none;border-top:0.5px solid var(--border2);margin:0;">', unsafe_allow_html=True)
+    st.markdown("<div style='padding:20px 24px;'>", unsafe_allow_html=True)
+
+    st.markdown(
+        '<span class="lbl">Weighted Average Calculation</span>'
+        f'<div style="font-size:0.85rem;color:var(--t2);margin-bottom:12px;">'
+        f'How the {forecast_months}-month weighted average price change of '
+        f'<strong style="color:var(--t1);">{summary.get("weighted_avg_change_pct", 0):+.2f}%</strong> '
+        f'was calculated for <strong style="color:var(--t1);">{selected_cat}</strong> ({selected_region}).'
+        '</div>',
+        unsafe_allow_html=True)
+
+    # Build the calculation table
+    rows_html = ""
+    total_check = 0.0
+    for ch in summary["cost_heads"]:
+        try:
+            wt = float(ch.get("weight_pct", 0))
+        except: wt = 0.0
+        try:
+            infl = float(ch.get("projected_change_pct", 0))
+        except: infl = 0.0
+        weighted = round(wt * infl / 100, 3)
+        total_check += weighted
+
+        infl_color = "#fb923c" if infl > 0 else ("#3fb950" if infl < 0 else "#d29922")
+        wgt_color = "#fb923c" if weighted > 0 else ("#3fb950" if weighted < 0 else "#d29922")
+        infl_sign = "+" if infl > 0 else ""
+        wgt_sign = "+" if weighted > 0 else ""
+        proxy = ' <span style="color:#fbbf24;font-size:0.6rem;">[PROXY]</span>' if ch.get("is_proxy") else ""
+
+        rows_html += (
+            f'<tr style="border-bottom:0.5px solid rgba(255,255,255,0.04);">'
+            f'<td style="padding:10px 12px;font-size:0.82rem;color:var(--t1);font-weight:500;">'
+            f'{ch["name"]}{proxy}<br>'
+            f'<span style="font-size:0.7rem;color:var(--blue);font-family:DM Mono;font-weight:400;">{ch["best_fit_index"]}</span></td>'
+            f'<td style="padding:10px 12px;text-align:center;font-family:DM Mono;font-size:0.85rem;color:var(--t2);">{wt:.1f}%</td>'
+            f'<td style="padding:10px 12px;text-align:center;font-family:DM Mono;font-size:0.9rem;color:{infl_color};font-weight:500;">{infl_sign}{infl:.2f}%</td>'
+            f'<td style="padding:10px 12px;text-align:center;font-family:DM Mono;font-size:0.9rem;color:{wgt_color};font-weight:500;">{wgt_sign}{weighted:+.3f}%</td>'
+            f'<td style="padding:10px 12px;font-size:0.78rem;color:var(--t2);line-height:1.55;">{ch.get("rationale","")}</td>'
+            f'</tr>'
+        )
+
+    # Total row - use the model's reported weighted average
+    reported_total = float(summary.get("weighted_avg_change_pct", 0))
+    total_color = "#fb923c" if reported_total > 0 else ("#3fb950" if reported_total < 0 else "#d29922")
+    total_sign = "+" if reported_total > 0 else ""
+
+    table_html = (
+        '<div class="card" style="overflow-x:auto;padding:0;">'
+        '<table style="width:100%;border-collapse:collapse;">'
+        '<thead><tr style="background:var(--bg);border-bottom:1px solid var(--border2);">'
+        '<th style="padding:10px 12px;text-align:left;font-size:0.62rem;color:var(--t3);font-family:DM Mono;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;">Cost Head / Benchmark</th>'
+        '<th style="padding:10px 12px;text-align:center;font-size:0.62rem;color:var(--t3);font-family:DM Mono;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;">Weight</th>'
+        '<th style="padding:10px 12px;text-align:center;font-size:0.62rem;color:var(--t3);font-family:DM Mono;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;">Inflation</th>'
+        '<th style="padding:10px 12px;text-align:center;font-size:0.62rem;color:var(--t3);font-family:DM Mono;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;">Wt &times; Infl</th>'
+        '<th style="padding:10px 12px;text-align:left;font-size:0.62rem;color:var(--t3);font-family:DM Mono;font-weight:500;text-transform:uppercase;letter-spacing:0.08em;">Rationale</th>'
+        '</tr></thead><tbody>'
+        f'{rows_html}'
+        '<tr style="background:rgba(88,166,255,0.08);border-top:1.5px solid var(--blue-bd);">'
+        '<td style="padding:14px 12px;font-size:0.9rem;color:var(--t1);font-weight:600;">WEIGHTED AVERAGE</td>'
+        '<td style="padding:14px 12px;text-align:center;font-family:DM Mono;font-size:0.85rem;color:var(--t2);font-weight:600;">100.0%</td>'
+        '<td style="padding:14px 12px;text-align:center;color:var(--t3);font-family:DM Mono;font-size:0.75rem;">&mdash;</td>'
+        f'<td style="padding:14px 12px;text-align:center;font-family:DM Mono;font-size:1.05rem;color:{total_color};font-weight:600;">{total_sign}{reported_total:.2f}%</td>'
+        f'<td style="padding:14px 12px;font-size:0.75rem;color:var(--t2);">'
+        f'Estimated weighted average price change over {forecast_months} months</td>'
+        '</tr>'
+        '</tbody></table></div>'
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div style="font-size:0.7rem;color:var(--t3);margin-top:6px;">'
+        f'&#9888; Inflation values are estimates based on public forward signals as of {today_str()}. '
+        f'Each cost-head weighted contribution is calculated as (Weight % &times; Inflation %) &divide; 100.</div>',
+        unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ── BOTTOM SECTION — Detailed analysis (full width) ─────────────────────────────
